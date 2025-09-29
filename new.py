@@ -1,109 +1,232 @@
-# pip install ultralytics opencv-python numpy
-# python referee_highlight.py
+"""Lightweight YOLO NCNN runner with FPS overlay.
 
-import cv2, time, collections
-import numpy as np
+This script mirrors the command-line interface used by ``test.py`` but is
+intended for quick experiments where you want to monitor detection FPS in
+real time.  It keeps the codebase torch-free and uses the NCNN export of
+Ultralytics models, making it friendly for Raspberry Pi deployments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+from typing import Iterable, Optional, Tuple
+
+import cv2
 from ultralytics import YOLO
 
-# ---------------- CONFIG ----------------
-WEIGHTS   = "weights.pt"
-CONF      = 0.35
-CLASS_OK  = None
-COOLDOWN_FRAMES = 8
-FPS       = 20              # fps camera (nếu khác thì set lại)
-HISTORY_S = 10              # số giây muốn giữ lại trước khi ghi điểm
-CAMERA_INDEX = 1
-# ----------------------------------------
 
-def point_side_of_diag(x, y, w, h):
-    x1, y1 = w - 1, 0
-    x2, y2 = 0, h - 1
-    return (x - x2) * (y1 - y2) - (y - y2) * (x1 - x2)
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
-def side_label(x, y, w, h):
-    ref = point_side_of_diag(w - 5, 5, w, h)
-    val = point_side_of_diag(x, y, w, h)
-    return "IN" if val * ref >= 0 else "OUT"
 
-def draw_ui(frame, score, state):
-    h, w = frame.shape[:2]
-    cv2.line(frame, (w - 1, 0), (0, h - 1), (0, 255, 255), 2, cv2.LINE_AA)
-    overlay = frame.copy()
-    pts = np.array([[w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.int32)
-    cv2.fillConvexPoly(overlay, pts, (0, 255, 0))
-    frame[:] = cv2.addWeighted(overlay, 0.08, frame, 0.92, 0)
-    cv2.rectangle(frame, (10, 10), (270, 82), (0, 0, 0), -1)
-    cv2.putText(frame, f"SCORE: {score}", (20, 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, f"STATE: {state}", (20, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (0, 255, 255) if state == "IN" else (0, 140, 255) if state == "OUT" else (200, 200, 200),
-                2, cv2.LINE_AA)
-    return frame
+def parse_resolution(value: str) -> Tuple[int, int]:
+    try:
+        w_str, h_str = value.lower().split("x", 1)
+        width, height = int(w_str), int(h_str)
+    except (ValueError, AttributeError) as exc:
+        raise argparse.ArgumentTypeError(
+            "Resolution must be in the form <width>x<height>"
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("Resolution values must be positive")
+    return width, height
 
-def main():
-    model = YOLO(WEIGHTS)
-    names = model.names
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open webcam")
 
-    score, prev_side = 0, None
-    last_score_frame, frame_idx = -9999, 0
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run YOLO NCNN with FPS overlay")
+    parser.add_argument("--model", required=True, help="Path to *_ncnn_model directory")
+    parser.add_argument("--source", default="0", help="Camera index, video file, or image folder")
+    parser.add_argument("--resolution", default="640x480", help="Resolution for webcams (e.g. 640x480)")
+    parser.add_argument("--save", action="store_true", help="Save annotated output")
+    return parser.parse_args()
 
-    print("[INFO] q: quit, r: reset score")
+
+def as_camera_index(source: str) -> Optional[int]:
+    try:
+        return int(source)
+    except ValueError:
+        return None
+
+
+def iter_images(folder: Path) -> Iterable[Path]:
+    for path in sorted(folder.iterdir()):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            yield path
+
+
+def ensure_save_dir(label: str) -> Path:
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    save_dir = Path("runs") / f"demo_{label}_{timestamp}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    return save_dir
+
+
+def annotate(model: YOLO, frame, imgsz: int):
+    results = model.predict(frame, imgsz=imgsz, device="cpu", verbose=False)
+    annotated = results[0].plot()
+    return annotated, results[0]
+
+
+def draw_fps(frame, fps: float) -> None:
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.1f}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def run_camera(model: YOLO, index: int, resolution: Tuple[int, int], save: bool) -> None:
+    width, height = resolution
+    capture = cv2.VideoCapture(index)
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if not capture.isOpened():
+        raise RuntimeError(f"Unable to open camera index {index}")
+
+    save_dir = ensure_save_dir("camera") if save else None
+    writer = None
+    imgsz = max(width, height)
+    window = "YOLO NCNN Demo"
+
+    print("Press ESC to exit.")
+    prev = time.time()
     while True:
-        ok, frame = cap.read()
+        ok, frame = capture.read()
+        if not ok:
+            print("[WARN] Failed to grab camera frame")
+            break
+
+        now = time.time()
+        dt = now - prev
+        prev = now
+        fps = 1.0 / dt if dt > 0 else 0.0
+
+        annotated, _ = annotate(model, frame, imgsz)
+        draw_fps(annotated, fps)
+
+        if save and save_dir is not None:
+            if writer is None:
+                fps_cap = capture.get(cv2.CAP_PROP_FPS) or 30
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                output_path = save_dir / "camera.mp4"
+                writer = cv2.VideoWriter(str(output_path), fourcc, fps_cap, (annotated.shape[1], annotated.shape[0]))
+                print(f"[INFO] Saving video to {output_path}")
+            writer.write(annotated)
+
+        cv2.imshow(window, annotated)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    capture.release()
+    if writer is not None:
+        writer.release()
+    cv2.destroyAllWindows()
+
+
+def run_video(model: YOLO, path: Path | str, save: bool) -> None:
+    path_str = str(path)
+    capture = cv2.VideoCapture(path_str)
+    if not capture.isOpened():
+        raise RuntimeError(f"Unable to open video source: {path}")
+
+    fps_in = capture.get(cv2.CAP_PROP_FPS) or 30
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+    imgsz = max(width, height)
+
+    label = Path(path_str).stem or "stream"
+    save_dir = ensure_save_dir(label) if save else None
+    writer = None
+    window = f"YOLO NCNN Demo - {Path(path_str).name or path_str}"
+
+    print("Press ESC to exit.")
+    prev = time.time()
+    while True:
+        ok, frame = capture.read()
         if not ok:
             break
-        h, w = frame.shape[:2]
 
-        results = model(frame, conf=CONF, verbose=False)
-        r = results[0]
-        boxes = r.boxes
+        now = time.time()
+        dt = now - prev
+        prev = now
+        fps = 1.0 / dt if dt > 0 else 0.0
 
-        curr_state = "NO_BALL"
-        if boxes is not None and len(boxes) > 0:
-            xyxy = boxes.xyxy.cpu().numpy()
-            conf = boxes.conf.cpu().numpy()
-            cls  = boxes.cls.cpu().numpy().astype(int)
+        annotated, _ = annotate(model, frame, imgsz)
+        draw_fps(annotated, fps)
 
-            idxs = list(range(len(cls)))
-            if CLASS_OK is not None and names:
-                idxs = [i for i in idxs if names[cls[i]] == CLASS_OK]
+        if save and save_dir is not None:
+            if writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                output_path = save_dir / f"{label}_annotated.mp4"
+                writer = cv2.VideoWriter(str(output_path), fourcc, fps_in, (annotated.shape[1], annotated.shape[0]))
+                print(f"[INFO] Saving video to {output_path}")
+            writer.write(annotated)
 
-            if idxs:
-                best_i = max(idxs, key=lambda i: conf[i])
-                x1, y1, x2, y2 = xyxy[best_i].astype(int)
-                cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (50, 200, 255), 2, cv2.LINE_AA)
-                label = f"{names[cls[best_i]] if names else cls[best_i]} {conf[best_i]:.2f}"
-                cv2.putText(frame, label, (x1, max(20, y1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 200, 255), 2, cv2.LINE_AA)
-                cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1, cv2.LINE_AA)
-
-                curr_state = side_label(cx, cy, w, h)
-
-                if prev_side == "IN" and curr_state == "OUT":
-                    if frame_idx - last_score_frame >= COOLDOWN_FRAMES:
-                        score += 1
-                        last_score_frame = frame_idx
-                prev_side = curr_state
-
-        frame = draw_ui(frame, score, curr_state)
-        cv2.imshow("Realtime Referee", frame)
-
-        k = cv2.waitKey(1) & 0xFF
-        if k == ord('q'):
+        cv2.imshow(window, annotated)
+        if cv2.waitKey(1) & 0xFF == 27:
             break
-        elif k == ord('r'):
-            score, prev_side, last_score_frame = 0, None, -9999
-            print("[INFO] Score reset.")
 
-        frame_idx += 1
-
-    cap.release()
+    capture.release()
+    if writer is not None:
+        writer.release()
     cv2.destroyAllWindows()
+
+
+def run_directory(model: YOLO, folder: Path, save: bool) -> None:
+    images = list(iter_images(folder))
+    if not images:
+        raise RuntimeError(f"No image files found in {folder}")
+
+    save_dir = ensure_save_dir(folder.stem) if save else None
+    if save_dir is not None:
+        (save_dir / "images").mkdir(parents=True, exist_ok=True)
+
+    window = f"YOLO NCNN Demo - {folder.name}"
+    for image_path in images:
+        frame = cv2.imread(str(image_path))
+        if frame is None:
+            print(f"[WARN] Unable to read {image_path}")
+            continue
+        imgsz = max(frame.shape[0], frame.shape[1])
+        annotated, _ = annotate(model, frame, imgsz)
+        draw_fps(annotated, 0.0)
+
+        if save and save_dir is not None:
+            output_path = save_dir / "images" / image_path.name
+            cv2.imwrite(str(output_path), annotated)
+
+        cv2.imshow(window, annotated)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cv2.destroyAllWindows()
+
+
+def main() -> None:
+    args = parse_args()
+    resolution = parse_resolution(args.resolution)
+
+    print(f"[INFO] Loading NCNN model from: {args.model}")
+    model = YOLO(args.model)
+
+    camera_index = as_camera_index(args.source)
+    source_path = Path(args.source)
+
+    if camera_index is not None and not source_path.exists():
+        run_camera(model, camera_index, resolution, args.save)
+    elif source_path.is_dir():
+        run_directory(model, source_path, args.save)
+    elif source_path.is_file():
+        run_video(model, source_path, args.save)
+    else:
+        run_video(model, args.source, args.save)
+
 
 if __name__ == "__main__":
     main()
